@@ -1,0 +1,78 @@
+# Pubblica SpesaSmart su GitHub Pages.
+# I prezzi carburanti (open data MIMIT) arrivano dal ramo "carburanti", caricato ogni mattina dal PC
+# con scripts/pubblica-carburanti.mjs: il sito MIMIT non risponde ai server di GitHub (esteri).
+name: Pubblica
+
+on:
+  push:
+    branches: [main, carburanti]
+  schedule:
+    - cron: '0 9 * * *' # tentativo giornaliero di riserva
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main # anche quando la pubblicazione parte dal ramo dei dati
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Prezzi carburanti
+        continue-on-error: true # senza dati l'app si pubblica comunque e mostra «non disponibile»
+        run: |
+          # 1) download diretto (di solito bloccato da GitHub), 2) CSV caricati dal PC sul ramo "carburanti"
+          if timeout 60 npm run fuel:update; then exit 0; fi
+          mkdir -p /tmp/carburanti
+          git fetch --depth=1 origin carburanti
+          git --work-tree=/tmp/carburanti checkout FETCH_HEAD -- anagrafica_impianti_attivi.csv prezzo_alle_8.csv
+          git reset -q
+          node scripts/update-fuel.mjs --from-dir /tmp/carburanti
+      # Supermercati: estratto Italia di OpenStreetMap (Geofabrik), rigenerato una volta a settimana.
+      - id: settimana
+        run: echo "settimana=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+      - id: negozi
+        uses: actions/cache@v4
+        with:
+          path: public/data/negozi
+          key: negozi-${{ steps.settimana.outputs.settimana }}
+      - name: Supermercati (OpenStreetMap)
+        if: steps.negozi.outputs.cache-hit != 'true'
+        continue-on-error: true # senza file l'app cerca i negozi direttamente su Overpass
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool
+          curl -sSfL -o /tmp/italia.osm.pbf https://download.geofabrik.de/europe/italy-latest.osm.pbf
+          osmium tags-filter /tmp/italia.osm.pbf nwr/shop=supermarket,convenience -o /tmp/negozi.osm.pbf
+          osmium export /tmp/negozi.osm.pbf -f geojsonseq -a type,id --geometry-types=point,polygon -o /tmp/negozi.geojsonseq
+          node scripts/update-stores.mjs /tmp/negozi.geojsonseq
+      - name: Compila
+        run: npm run build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
